@@ -6,6 +6,7 @@ El "Marcar como postulado" queda guardado en localStorage del navegador de
 Yrlex (por dispositivo) — no requiere backend ni login.
 """
 
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -78,11 +79,18 @@ PAGE_TMPL = """<!DOCTYPE html>
 """
 
 
+def stable_job_id(url: str) -> str:
+    # hash() nativo de Python está aleatorizado por proceso (PEP 456) — el
+    # mismo aviso tendría un id distinto en cada corrida del workflow,
+    # rompiendo el "Ya me postulé" guardado en localStorage al día siguiente.
+    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+
+
 def build():
     jobs = json.loads(JOBS_PATH.read_text(encoding="utf-8")) if JOBS_PATH.exists() else []
     cards = "\n".join(
         JOB_CARD_TMPL.format(
-            job_id=str(abs(hash(j["url"]))),
+            job_id=stable_job_id(j["url"]),
             title=j["title"],
             platform=j["platform"],
             url=j["url"],
