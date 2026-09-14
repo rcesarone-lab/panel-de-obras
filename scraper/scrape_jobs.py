@@ -48,6 +48,14 @@ USER_AGENT = (
 #   con hashes que cambian en cada deploy de ZonaJobs/Bumeran), pero publica
 #   un <script type="application/ld+json"> con @type "ItemList" que ya trae
 #   título + url de cada aviso — mucho más confiable que perseguir clases.
+# "paginate_param": nombre del query param que cada sitio usa para pasar de
+# página (verificado en vivo comparando urls devueltas en pag. 1 vs pag. 2 —
+# CompuTrabajo ignora "pagina" y solo responde a "p"). LinkedIn no tiene
+# paginación disponible sin login (probado con &start=25: devuelve la misma
+# página 1), así que no lleva esta clave y se scrapea una sola vez.
+COMPUTRABAJO_LOCATION_SELECTOR = "p.fs16.fc_base.mt5:not(.dFlex)"
+COMPUTRABAJO_COMPANY_SELECTOR = "p.dFlex.fs16.fc_base.mt5 a"
+
 SEARCHES = [
     ("LinkedIn", "https://ar.linkedin.com/jobs/jefe-de-obra-empleos", {"mode": "dom", "selector": "div.base-card", "label": "Jefe de Obra"}),
     ("LinkedIn", "https://ar.linkedin.com/jobs/supervisor-de-obras-empleos", {"mode": "dom", "selector": "div.base-card", "label": "Supervisor de Obras"}),
@@ -55,23 +63,35 @@ SEARCHES = [
     # La URL vieja (.../buenos-aires/ofertas-de-trabajo-direccion-de-obra.html)
     # da 404 — ZonaJobs cambió su estructura de URLs. Esta es la vigente,
     # verificada navegando el buscador del sitio en vivo.
-    ("ZonaJobs", "https://www.zonajobs.com.ar/empleos-busqueda-jefe-de-obra.html", {"mode": "jsonld", "label": "Jefe de Obra"}),
+    ("ZonaJobs", "https://www.zonajobs.com.ar/empleos-busqueda-jefe-de-obra.html", {"mode": "jsonld", "label": "Jefe de Obra", "paginate_param": "page"}),
     # CompuTrabajo no marca la ubicación con ninguna clase que la identifique
     # (usa las mismas utility classes "fs16 fc_base mt5" que el nombre de la
     # empresa) — el <p> de ubicación es el único de esos que no tiene además
-    # la clase "dFlex", así que lo distinguimos por eso.
-    ("CompuTrabajo", "https://ar.computrabajo.com/trabajo-de-jefe-de-obra", {"mode": "dom", "selector": "article.box_offer", "location_selector": "p.fs16.fc_base.mt5:not(.dFlex)", "label": "Jefe de Obra"}),
-    ("Bumeran", "https://www.bumeran.com.ar/empleos-busqueda-jefe-de-obra.html", {"mode": "jsonld", "label": "Jefe de Obra"}),
+    # la clase "dFlex" (esa sí la tiene el de la empresa), así que los
+    # distinguimos por eso.
+    ("CompuTrabajo", "https://ar.computrabajo.com/trabajo-de-jefe-de-obra", {"mode": "dom", "selector": "article.box_offer", "location_selector": COMPUTRABAJO_LOCATION_SELECTOR, "company_selector": COMPUTRABAJO_COMPANY_SELECTOR, "label": "Jefe de Obra", "paginate_param": "p"}),
+    ("Bumeran", "https://www.bumeran.com.ar/empleos-busqueda-jefe-de-obra.html", {"mode": "jsonld", "label": "Jefe de Obra", "paginate_param": "page"}),
     # Minería: el perfil de Yrlex la incluye (ver KEYWORDS) pero ninguna
     # búsqueda de arriba la cubre — todas son variantes de "obra", así que
     # un aviso titulado p.ej. "Supervisor de Mina" nunca aparecía. Agregado
     # y verificado en vivo (Salta/San Juan entre los resultados reales).
     ("LinkedIn", "https://ar.linkedin.com/jobs/mineria-empleos", {"mode": "dom", "selector": "div.base-card", "label": "Minería"}),
     ("LinkedIn", "https://ar.linkedin.com/jobs/supervisor-de-mina-empleos", {"mode": "dom", "selector": "div.base-card", "label": "Supervisor de Mina"}),
-    ("ZonaJobs", "https://www.zonajobs.com.ar/empleos-busqueda-mineria.html", {"mode": "jsonld", "label": "Minería"}),
-    ("CompuTrabajo", "https://ar.computrabajo.com/trabajo-de-mineria", {"mode": "dom", "selector": "article.box_offer", "location_selector": "p.fs16.fc_base.mt5:not(.dFlex)", "label": "Minería"}),
-    ("Bumeran", "https://www.bumeran.com.ar/empleos-busqueda-mineria.html", {"mode": "jsonld", "label": "Minería"}),
+    ("ZonaJobs", "https://www.zonajobs.com.ar/empleos-busqueda-mineria.html", {"mode": "jsonld", "label": "Minería", "paginate_param": "page"}),
+    ("CompuTrabajo", "https://ar.computrabajo.com/trabajo-de-mineria", {"mode": "dom", "selector": "article.box_offer", "location_selector": COMPUTRABAJO_LOCATION_SELECTOR, "company_selector": COMPUTRABAJO_COMPANY_SELECTOR, "label": "Minería", "paginate_param": "p"}),
+    ("Bumeran", "https://www.bumeran.com.ar/empleos-busqueda-mineria.html", {"mode": "jsonld", "label": "Minería", "paginate_param": "page"}),
 ]
+
+# Tope de páginas por búsqueda — la paginación corta antes si una página no
+# trae avisos nuevos (ver scrape()), así que esto es solo un techo de
+# seguridad para no quedar dando vueltas en una búsqueda enorme (LinkedIn
+# "minería" tiene 2000+, pero ahí no aplica: no hay paginación sin login).
+MAX_PAGES = 5
+
+
+def paginated_url(base_url: str, param: str, page_num: int) -> str:
+    sep = "&" if "?" in base_url else "?"
+    return f"{base_url}{sep}{param}={page_num}"
 
 # Palabras clave del CV para marcar afinidad (no descarta nada, solo puntúa)
 KEYWORDS = [
@@ -86,41 +106,64 @@ def score(text: str) -> int:
 
 
 GENERIC_LOCATION_SELECTOR = "[class*='location'], [class*='ubicacion'], .job-location, span[class*='place']"
+# h4/.subtitle es lo que trae el nombre de empresa en las cards de LinkedIn
+# (verificado en vivo); CompuTrabajo usa su propio override (ver SEARCHES).
+GENERIC_COMPANY_SELECTOR = "h4, .subtitle, [class*='subtitle'], a[class*='company']"
 
 
-def extract_dom_cards(page, url, selector, location_selector=None):
+def extract_dom_cards(page, url, selector, location_selector=None, company_selector=None):
     items = []
-    for card in page.query_selector_all(selector)[:15]:
+    for card in page.query_selector_all(selector):
         title_el = card.query_selector("h3, h2, .title, [class*='title']")
         link_el = card.query_selector("a")
         location_el = card.query_selector(location_selector or GENERIC_LOCATION_SELECTOR)
+        company_el = card.query_selector(company_selector or GENERIC_COMPANY_SELECTOR)
         title_text = title_el.inner_text() if title_el else card.inner_text()
         title = title_text.split("\n")[0].strip()
         link = link_el.get_attribute("href") if link_el else url
         location = location_el.inner_text().strip() if location_el else None
+        company = company_el.inner_text().strip() if company_el else None
         if link and link.startswith("/"):
             base = re.match(r"https?://[^/]+", url).group(0)
             link = base + link
         if title and link:
-            items.append((title, link, location))
+            items.append((title, link, location, company))
     return items
 
 
-def extract_navent_location_map(page):
-    """ZonaJobs y Bumeran (grupo Navent) no tienen clases CSS estables, pero
-    cada card marca la ubicación con un ícono con aria-label="Ubicación"
-    (atributo semántico, no un hash de styled-components) seguido del texto
-    en el elemento hermano. Devuelve {path_del_aviso: texto_ubicacion}."""
+def extract_navent_card_map(page):
+    """ZonaJobs y Bumeran (grupo Navent) no tienen clases CSS estables
+    (styled-components con hashes que cambian en cada deploy), pero cada
+    card tiene: un ícono con aria-label="Ubicación" seguido del texto de
+    ubicación, y (más arriba, sin ícono) un <h3> con el nombre de empresa —
+    lo distinguimos de la fecha ("Publicado hace...") y de los <h3> de
+    ubicación/modalidad (que sí están precedidos por un ícono con
+    aria-label) tomando el primer <h3> "suelto" que quede. Devuelve
+    {path_del_aviso: {"location":..., "company":...}}."""
     return page.evaluate(
         """
         () => {
             const map = {};
-            document.querySelectorAll('i[aria-label="Ubicación"]').forEach(icon => {
-                const sibling = icon.nextElementSibling;
-                const text = sibling ? sibling.textContent.trim() : null;
-                const a = icon.closest('a[href*="/empleos/"]');
-                if (a && text) {
-                    map[a.getAttribute('href')] = text;
+            document.querySelectorAll('a[href*="/empleos/"]').forEach(a => {
+                const href = a.getAttribute('href');
+                if (!map[href]) map[href] = {location: null, company: null};
+
+                const icon = a.querySelector('i[aria-label="Ubicación"]');
+                if (icon) {
+                    const sibling = icon.nextElementSibling;
+                    if (sibling) map[href].location = sibling.textContent.trim();
+                }
+
+                const h3s = Array.from(a.querySelectorAll('h3'));
+                for (const h3 of h3s) {
+                    const text = h3.textContent.trim();
+                    if (!text || /^Publicado|^Actualizado/.test(text)) continue;
+                    const parentSpan = h3.closest('span');
+                    const prev = parentSpan && parentSpan.previousElementSibling;
+                    const prevIcon = prev && prev.tagName === 'I' && prev.hasAttribute('aria-label');
+                    if (prevIcon) continue;
+                    map[href].company = text;
+                    break;
                 }
             });
             return map;
@@ -133,10 +176,10 @@ def extract_jsonld_items(page):
     """Lee los <script type="application/ld+json"> con @type ItemList.
     Puede haber varios bloques ld+json en la página (breadcrumbs, etc.) y
     alguno vacío antes de la hidratación; nos quedamos con el primero que
-    traiga avisos reales. El ItemList en sí solo trae name + url, así que la
-    ubicación se cruza aparte con extract_navent_location_map por el path
-    de la url (matcheando contra el href relativo del ícono de ubicación)."""
-    location_map = extract_navent_location_map(page)
+    traiga avisos reales. El ItemList en sí solo trae name + url, así que
+    ubicación y empresa se cruzan aparte con extract_navent_card_map por el
+    path de la url (matcheando contra el href relativo de cada card)."""
+    card_map = extract_navent_card_map(page)
     for script in page.query_selector_all('script[type="application/ld+json"]'):
         raw = script.inner_text()
         try:
@@ -151,10 +194,10 @@ def extract_jsonld_items(page):
             if not (el.get("name") and el.get("url")):
                 continue
             path = urlparse(el["url"]).path
-            location = location_map.get(path)
-            items.append((el["name"], el["url"], location))
+            details = card_map.get(path, {})
+            items.append((el["name"], el["url"], details.get("location"), details.get("company")))
         if items:
-            return items[:15]
+            return items
     return []
 
 
@@ -177,41 +220,66 @@ def scrape():
         page = context.new_page()
 
         for platform, url, cfg in SEARCHES:
-            try:
-                page.goto(url, timeout=30000, wait_until="networkidle")
-            except PlaywrightTimeoutError:
-                # networkidle a veces no se cumple nunca en sitios con
-                # tracking/ads en background (visto en LinkedIn), pero el
-                # listado ya puede estar completo igual — seguimos e
-                # intentamos extraer en vez de descartar la búsqueda entera.
-                print(f"[warn] {platform} ({url}) no llegó a networkidle en el timeout, sigo con lo que cargó")
-            except Exception as e:
-                print(f"[warn] fallo en {platform} ({url}): {e}")
-                continue
+            paginate_param = cfg.get("paginate_param")
+            max_pages = MAX_PAGES if paginate_param else 1
+            search_seen_urls = set()  # canónicas, para saber si una página trajo algo nuevo
+            found_any_page = False
 
-            page.wait_for_timeout(2000)  # deja asentar el render JS
+            for page_num in range(1, max_pages + 1):
+                page_url = paginated_url(url, paginate_param, page_num) if page_num > 1 else url
+                try:
+                    page.goto(page_url, timeout=30000, wait_until="networkidle")
+                except PlaywrightTimeoutError:
+                    # networkidle a veces no se cumple nunca en sitios con
+                    # tracking/ads en background (visto en LinkedIn), pero el
+                    # listado ya puede estar completo igual — seguimos e
+                    # intentamos extraer en vez de descartar la búsqueda entera.
+                    print(f"[warn] {platform} ({page_url}) no llegó a networkidle en el timeout, sigo con lo que cargó")
+                except Exception as e:
+                    print(f"[warn] fallo en {platform} ({page_url}): {e}")
+                    break
 
-            try:
-                if cfg["mode"] == "jsonld":
-                    items = extract_jsonld_items(page)
-                else:
-                    items = extract_dom_cards(page, url, cfg["selector"], cfg.get("location_selector"))
-            except Exception as e:
-                print(f"[warn] no se pudo extraer {platform} ({url}): {e}")
-                continue
+                page.wait_for_timeout(2000)  # deja asentar el render JS
 
-            if not items:
-                print(f"[warn] {platform} ({url}) no trajo avisos — revisar selector o bloqueo de bot")
+                try:
+                    if cfg["mode"] == "jsonld":
+                        items = extract_jsonld_items(page)
+                    else:
+                        items = extract_dom_cards(
+                            page, page_url, cfg["selector"], cfg.get("location_selector"), cfg.get("company_selector")
+                        )
+                except Exception as e:
+                    print(f"[warn] no se pudo extraer {platform} ({page_url}): {e}")
+                    break
 
-            for title, link, location in items:
-                results.append({
-                    "platform": platform,
-                    "title": title,
-                    "url": link,
-                    "location": location,
-                    "score": score(title),
-                    "found_at": datetime.now(timezone.utc).isoformat(),
-                })
+                if not items:
+                    if not found_any_page:
+                        print(f"[warn] {platform} ({page_url}) no trajo avisos — revisar selector o bloqueo de bot")
+                    break  # página vacía: no hay más que paginar
+
+                new_in_this_page = 0
+                for title, link, location, company in items:
+                    key = canonical_url(link)
+                    if key in search_seen_urls:
+                        continue
+                    search_seen_urls.add(key)
+                    new_in_this_page += 1
+                    results.append({
+                        "platform": platform,
+                        "title": title,
+                        "url": link,
+                        "location": location,
+                        "company": company,
+                        "score": score(title),
+                        "found_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                found_any_page = True
+
+                if paginate_param and new_in_this_page == 0:
+                    # La página siguiente no trajo nada que no tuviéramos ya
+                    # (se acabaron los resultados reales) — cortar en vez de
+                    # seguir pidiendo páginas de más.
+                    break
 
         browser.close()
 

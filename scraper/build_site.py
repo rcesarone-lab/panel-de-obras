@@ -8,6 +8,8 @@ Yrlex (por dispositivo) — no requiere backend ni login.
 
 import hashlib
 import json
+import re
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +19,12 @@ from scrape_jobs import SEARCHES
 HERE = Path(__file__).parent
 JOBS_PATH = HERE / "jobs.json"
 DIST_DIR = HERE.parent / "dist"
+
+# Cuántas tarjetas se muestran de entrada; el resto queda con `hidden` y se
+# revela con el botón "Cargar más avisos" (todo client-side, sin llamadas de
+# red nuevas — ya está todo en el HTML generado, solo se destapa).
+INITIAL_VISIBLE = 40
+LOAD_MORE_BATCH = 40
 
 # Datos fijos del perfil de Yrlex para el header del panel. Hasta que exista
 # un buscador dinámico basado en CV (a futuro), quedan hardcodeados acá.
@@ -42,6 +50,42 @@ PLATFORM_HOME_LINKS = {
     "CompuTrabajo": "https://ar.computrabajo.com",
     "Bumeran": "https://www.bumeran.com.ar",
 }
+
+def normalize_text(s: str) -> str:
+    """minúsculas, sin acentos, sin puntuación — para comparar título/empresa
+    entre plataformas donde el mismo aviso puede venir escrito distinto
+    ("Jefe de Obra" vs "JEFE DE OBRA", "S.A." vs "SA")."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return s.strip()
+
+
+def match_key(job: dict):
+    """Clave título+empresa normalizados para detectar el mismo aviso
+    publicado en más de una plataforma. No hay ID compartido entre sitios,
+    así que esto es un heurístico por texto — sin company (dato ausente en
+    algunas plataformas/avisos) no arriesgamos falsos positivos con títulos
+    genéricos tipo "Jefe de Obra", así que ahí no se intenta matchear."""
+    company = job.get("company")
+    if not company:
+        return None
+    return normalize_text(job.get("title", "")) + "||" + normalize_text(company)
+
+
+def attach_cross_platform_badges(jobs: list) -> None:
+    groups = {}
+    for j in jobs:
+        key = match_key(j)
+        if key:
+            groups.setdefault(key, set()).add(j["platform"])
+    for j in jobs:
+        key = match_key(j)
+        others = (groups.get(key, set()) - {j["platform"]}) if key else set()
+        j["_also_on"] = sorted(others)
+
 
 CALLOUT_TEXT = (
     "Todos los días a las 06:00 se recorren las búsquedas guardadas de abajo "
@@ -91,12 +135,15 @@ PLATFORM_BLOCK_TMPL = """
 </div>
 """
 
+DUPLICATE_BADGE_TMPL = '<p class="job-duplicate">🔁 También publicado en: {platforms}</p>'
+
 JOB_CARD_TMPL = """
-<div class="job-card" data-job-id="{job_id}">
+<div class="job-card" data-job-id="{job_id}" {hidden_attr}>
   <div class="job-main">
     <p class="job-title">{title}</p>
-    <p class="job-sub">{platform}</p>
+    <p class="job-sub">{platform}{company_suffix}</p>
     <p class="job-location">📍 {location}</p>
+    {duplicate_badge}
   </div>
   <div class="job-actions">
     <label class="applied-toggle">
@@ -124,6 +171,10 @@ PAGE_TMPL = """<!DOCTYPE html>
   .job-title{{font-family:'Oswald',sans-serif;font-weight:600;margin:0 0 4px;}}
   .job-sub{{font-family:'IBM Plex Mono',monospace;font-size:12px;color:#3C5A6E;margin:0;}}
   .job-location{{font-family:'IBM Plex Mono',monospace;font-size:12px;color:#B5502D;margin:4px 0 0;}}
+  .job-duplicate{{font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:#2A4152;background:#E2DECF;display:inline-block;padding:2px 8px;margin:6px 0 0;}}
+  .load-more-wrap{{text-align:center;margin:20px 0 10px;}}
+  .load-more-wrap p{{font-family:'IBM Plex Mono',monospace;font-size:12px;opacity:0.7;margin:0 0 10px;}}
+  .btn.secondary{{background:transparent;border:1px solid #20211D;cursor:pointer;}}
   .job-actions{{display:flex;align-items:center;gap:14px;}}
   .btn{{font-family:'IBM Plex Mono',monospace;font-size:12px;text-decoration:none;padding:8px 12px;background:#E8A427;color:#20211D;font-weight:600;}}
   .applied-toggle{{font-family:'IBM Plex Mono',monospace;font-size:12px;display:flex;gap:6px;align-items:center;}}
@@ -163,6 +214,7 @@ PAGE_TMPL = """<!DOCTYPE html>
   <h2 class="section-title"><span class="num">02</span> Avisos encontrados hoy ({job_count})</h2>
   <p class="section-note">Se actualiza solo, todos los días a las 06:00.</p>
   {cards}
+  {load_more_html}
   <footer>Generado por el scraper diario. Lo tildado como "ya me postulé" se guarda solo en este navegador.</footer>
 </div>
 <script>
@@ -179,6 +231,28 @@ PAGE_TMPL = """<!DOCTYPE html>
       }} catch (e) {{}}
     }});
   }});
+
+  (function () {{
+    const btn = document.getElementById('load-more-btn');
+    if (!btn) return;
+    const status = document.getElementById('load-more-status');
+    const total = document.querySelectorAll('.job-card').length;
+    let hidden = Array.from(document.querySelectorAll('.job-card[hidden]'));
+    let shown = total - hidden.length;
+    const batch = parseInt(btn.dataset.batch, 10);
+
+    function updateStatus() {{
+      status.textContent = 'Mostrando ' + shown + ' de ' + total + ' avisos';
+      if (hidden.length === 0) btn.hidden = true;
+    }}
+    btn.addEventListener('click', () => {{
+      const next = hidden.splice(0, batch);
+      next.forEach(card => card.hidden = false);
+      shown += next.length;
+      updateStatus();
+    }});
+    updateStatus();
+  }})();
 </script>
 </body>
 </html>
@@ -229,18 +303,40 @@ def build_platform_links_html() -> str:
     return "\n".join(blocks)
 
 
+def build_load_more_html(total: int) -> str:
+    if total <= INITIAL_VISIBLE:
+        return ""
+    return (
+        '<div class="load-more-wrap">'
+        f'<p id="load-more-status">Mostrando {min(INITIAL_VISIBLE, total)} de {total} avisos</p>'
+        f'<button id="load-more-btn" class="btn secondary" data-batch="{LOAD_MORE_BATCH}">Cargar más avisos</button>'
+        "</div>"
+    )
+
+
 def build():
     jobs = json.loads(JOBS_PATH.read_text(encoding="utf-8")) if JOBS_PATH.exists() else []
-    cards = "\n".join(
-        JOB_CARD_TMPL.format(
-            job_id=stable_job_id(j["url"]),
-            title=j["title"],
-            platform=j["platform"],
-            location=j.get("location") or "No especificado",
-            url=j["url"],
+    attach_cross_platform_badges(jobs)
+
+    card_htmls = []
+    for i, j in enumerate(jobs):
+        also_on = j.get("_also_on") or []
+        duplicate_badge = DUPLICATE_BADGE_TMPL.format(platforms=", ".join(also_on)) if also_on else ""
+        company = j.get("company")
+        card_htmls.append(
+            JOB_CARD_TMPL.format(
+                job_id=stable_job_id(j["url"]),
+                title=j["title"],
+                platform=j["platform"],
+                company_suffix=f" · {company}" if company else "",
+                location=j.get("location") or "No especificado",
+                duplicate_badge=duplicate_badge,
+                hidden_attr="hidden" if i >= INITIAL_VISIBLE else "",
+                url=j["url"],
+            )
         )
-        for j in jobs
-    )
+    cards = "\n".join(card_htmls)
+
     fecha = datetime.now().strftime("%d-%m-%Y %H:%M")
     html = PAGE_TMPL.format(
         fecha=fecha,
@@ -249,6 +345,7 @@ def build():
         platform_links=build_platform_links_html(),
         job_count=len(jobs),
         cards=cards,
+        load_more_html=build_load_more_html(len(jobs)),
     )
     DIST_DIR.mkdir(exist_ok=True)
     (DIST_DIR / "index.html").write_text(html, encoding="utf-8")
