@@ -20,6 +20,7 @@ JOB_CARD_TMPL = """
   <div class="job-main">
     <p class="job-title">{title}</p>
     <p class="job-sub">{platform}</p>
+    <p class="job-location">📍 {location}</p>
   </div>
   <div class="job-actions">
     <label class="applied-toggle">
@@ -46,6 +47,7 @@ PAGE_TMPL = """<!DOCTYPE html>
   .job-card.applied{{opacity:0.5;}}
   .job-title{{font-family:'Oswald',sans-serif;font-weight:600;margin:0 0 4px;}}
   .job-sub{{font-family:'IBM Plex Mono',monospace;font-size:12px;color:#3C5A6E;margin:0;}}
+  .job-location{{font-family:'IBM Plex Mono',monospace;font-size:12px;color:#B5502D;margin:4px 0 0;}}
   .job-actions{{display:flex;align-items:center;gap:14px;}}
   .btn{{font-family:'IBM Plex Mono',monospace;font-size:12px;text-decoration:none;padding:8px 12px;background:#E8A427;color:#20211D;font-weight:600;}}
   .applied-toggle{{font-family:'IBM Plex Mono',monospace;font-size:12px;display:flex;gap:6px;align-items:center;}}
@@ -93,6 +95,7 @@ def build():
             job_id=stable_job_id(j["url"]),
             title=j["title"],
             platform=j["platform"],
+            location=j.get("location") or "No especificado",
             url=j["url"],
         )
         for j in jobs

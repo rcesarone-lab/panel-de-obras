@@ -20,6 +20,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -53,7 +54,11 @@ SEARCHES = [
     # da 404 — ZonaJobs cambió su estructura de URLs. Esta es la vigente,
     # verificada navegando el buscador del sitio en vivo.
     ("ZonaJobs", "https://www.zonajobs.com.ar/empleos-busqueda-jefe-de-obra.html", {"mode": "jsonld"}),
-    ("CompuTrabajo", "https://ar.computrabajo.com/trabajo-de-jefe-de-obra", {"mode": "dom", "selector": "article.box_offer"}),
+    # CompuTrabajo no marca la ubicación con ninguna clase que la identifique
+    # (usa las mismas utility classes "fs16 fc_base mt5" que el nombre de la
+    # empresa) — el <p> de ubicación es el único de esos que no tiene además
+    # la clase "dFlex", así que lo distinguimos por eso.
+    ("CompuTrabajo", "https://ar.computrabajo.com/trabajo-de-jefe-de-obra", {"mode": "dom", "selector": "article.box_offer", "location_selector": "p.fs16.fc_base.mt5:not(.dFlex)"}),
     ("Bumeran", "https://www.bumeran.com.ar/empleos-busqueda-jefe-de-obra.html", {"mode": "jsonld"}),
 ]
 
@@ -69,27 +74,58 @@ def score(text: str) -> int:
     return sum(1 for k in KEYWORDS if k in t)
 
 
-def extract_dom_cards(page, url, selector):
+GENERIC_LOCATION_SELECTOR = "[class*='location'], [class*='ubicacion'], .job-location, span[class*='place']"
+
+
+def extract_dom_cards(page, url, selector, location_selector=None):
     items = []
     for card in page.query_selector_all(selector)[:15]:
         title_el = card.query_selector("h3, h2, .title, [class*='title']")
         link_el = card.query_selector("a")
+        location_el = card.query_selector(location_selector or GENERIC_LOCATION_SELECTOR)
         title_text = title_el.inner_text() if title_el else card.inner_text()
         title = title_text.split("\n")[0].strip()
         link = link_el.get_attribute("href") if link_el else url
+        location = location_el.inner_text().strip() if location_el else None
         if link and link.startswith("/"):
             base = re.match(r"https?://[^/]+", url).group(0)
             link = base + link
         if title and link:
-            items.append((title, link))
+            items.append((title, link, location))
     return items
+
+
+def extract_navent_location_map(page):
+    """ZonaJobs y Bumeran (grupo Navent) no tienen clases CSS estables, pero
+    cada card marca la ubicación con un ícono con aria-label="Ubicación"
+    (atributo semántico, no un hash de styled-components) seguido del texto
+    en el elemento hermano. Devuelve {path_del_aviso: texto_ubicacion}."""
+    return page.evaluate(
+        """
+        () => {
+            const map = {};
+            document.querySelectorAll('i[aria-label="Ubicación"]').forEach(icon => {
+                const sibling = icon.nextElementSibling;
+                const text = sibling ? sibling.textContent.trim() : null;
+                const a = icon.closest('a[href*="/empleos/"]');
+                if (a && text) {
+                    map[a.getAttribute('href')] = text;
+                }
+            });
+            return map;
+        }
+        """
+    )
 
 
 def extract_jsonld_items(page):
     """Lee los <script type="application/ld+json"> con @type ItemList.
     Puede haber varios bloques ld+json en la página (breadcrumbs, etc.) y
     alguno vacío antes de la hidratación; nos quedamos con el primero que
-    traiga avisos reales."""
+    traiga avisos reales. El ItemList en sí solo trae name + url, así que la
+    ubicación se cruza aparte con extract_navent_location_map por el path
+    de la url (matcheando contra el href relativo del ícono de ubicación)."""
+    location_map = extract_navent_location_map(page)
     for script in page.query_selector_all('script[type="application/ld+json"]'):
         raw = script.inner_text()
         try:
@@ -99,7 +135,13 @@ def extract_jsonld_items(page):
         if data.get("@type") != "ItemList":
             continue
         elements = data.get("itemListElement") or []
-        items = [(el["name"], el["url"]) for el in elements if el.get("name") and el.get("url")]
+        items = []
+        for el in elements:
+            if not (el.get("name") and el.get("url")):
+                continue
+            path = urlparse(el["url"]).path
+            location = location_map.get(path)
+            items.append((el["name"], el["url"], location))
         if items:
             return items[:15]
     return []
@@ -142,7 +184,7 @@ def scrape():
                 if cfg["mode"] == "jsonld":
                     items = extract_jsonld_items(page)
                 else:
-                    items = extract_dom_cards(page, url, cfg["selector"])
+                    items = extract_dom_cards(page, url, cfg["selector"], cfg.get("location_selector"))
             except Exception as e:
                 print(f"[warn] no se pudo extraer {platform} ({url}): {e}")
                 continue
@@ -150,11 +192,12 @@ def scrape():
             if not items:
                 print(f"[warn] {platform} ({url}) no trajo avisos — revisar selector o bloqueo de bot")
 
-            for title, link in items:
+            for title, link, location in items:
                 results.append({
                     "platform": platform,
                     "title": title,
                     "url": link,
+                    "location": location,
                     "score": score(title),
                     "found_at": datetime.now(timezone.utc).isoformat(),
                 })
