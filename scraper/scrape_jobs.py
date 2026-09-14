@@ -25,6 +25,8 @@ from urllib.parse import urlparse
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+from job_identity import canonical_url
+
 OUT_PATH = Path(__file__).parent / "jobs.json"
 
 # User-agent real de escritorio: ZonaJobs, Bumeran y CompuTrabajo están detrás
@@ -47,19 +49,28 @@ USER_AGENT = (
 #   un <script type="application/ld+json"> con @type "ItemList" que ya trae
 #   título + url de cada aviso — mucho más confiable que perseguir clases.
 SEARCHES = [
-    ("LinkedIn", "https://ar.linkedin.com/jobs/jefe-de-obra-empleos", {"mode": "dom", "selector": "div.base-card"}),
-    ("LinkedIn", "https://ar.linkedin.com/jobs/supervisor-de-obras-empleos", {"mode": "dom", "selector": "div.base-card"}),
-    ("LinkedIn", "https://ar.linkedin.com/jobs/industria-oil-gas-empleos", {"mode": "dom", "selector": "div.base-card"}),
+    ("LinkedIn", "https://ar.linkedin.com/jobs/jefe-de-obra-empleos", {"mode": "dom", "selector": "div.base-card", "label": "Jefe de Obra"}),
+    ("LinkedIn", "https://ar.linkedin.com/jobs/supervisor-de-obras-empleos", {"mode": "dom", "selector": "div.base-card", "label": "Supervisor de Obras"}),
+    ("LinkedIn", "https://ar.linkedin.com/jobs/industria-oil-gas-empleos", {"mode": "dom", "selector": "div.base-card", "label": "Industria Oil & Gas"}),
     # La URL vieja (.../buenos-aires/ofertas-de-trabajo-direccion-de-obra.html)
     # da 404 — ZonaJobs cambió su estructura de URLs. Esta es la vigente,
     # verificada navegando el buscador del sitio en vivo.
-    ("ZonaJobs", "https://www.zonajobs.com.ar/empleos-busqueda-jefe-de-obra.html", {"mode": "jsonld"}),
+    ("ZonaJobs", "https://www.zonajobs.com.ar/empleos-busqueda-jefe-de-obra.html", {"mode": "jsonld", "label": "Jefe de Obra"}),
     # CompuTrabajo no marca la ubicación con ninguna clase que la identifique
     # (usa las mismas utility classes "fs16 fc_base mt5" que el nombre de la
     # empresa) — el <p> de ubicación es el único de esos que no tiene además
     # la clase "dFlex", así que lo distinguimos por eso.
-    ("CompuTrabajo", "https://ar.computrabajo.com/trabajo-de-jefe-de-obra", {"mode": "dom", "selector": "article.box_offer", "location_selector": "p.fs16.fc_base.mt5:not(.dFlex)"}),
-    ("Bumeran", "https://www.bumeran.com.ar/empleos-busqueda-jefe-de-obra.html", {"mode": "jsonld"}),
+    ("CompuTrabajo", "https://ar.computrabajo.com/trabajo-de-jefe-de-obra", {"mode": "dom", "selector": "article.box_offer", "location_selector": "p.fs16.fc_base.mt5:not(.dFlex)", "label": "Jefe de Obra"}),
+    ("Bumeran", "https://www.bumeran.com.ar/empleos-busqueda-jefe-de-obra.html", {"mode": "jsonld", "label": "Jefe de Obra"}),
+    # Minería: el perfil de Yrlex la incluye (ver KEYWORDS) pero ninguna
+    # búsqueda de arriba la cubre — todas son variantes de "obra", así que
+    # un aviso titulado p.ej. "Supervisor de Mina" nunca aparecía. Agregado
+    # y verificado en vivo (Salta/San Juan entre los resultados reales).
+    ("LinkedIn", "https://ar.linkedin.com/jobs/mineria-empleos", {"mode": "dom", "selector": "div.base-card", "label": "Minería"}),
+    ("LinkedIn", "https://ar.linkedin.com/jobs/supervisor-de-mina-empleos", {"mode": "dom", "selector": "div.base-card", "label": "Supervisor de Mina"}),
+    ("ZonaJobs", "https://www.zonajobs.com.ar/empleos-busqueda-mineria.html", {"mode": "jsonld", "label": "Minería"}),
+    ("CompuTrabajo", "https://ar.computrabajo.com/trabajo-de-mineria", {"mode": "dom", "selector": "article.box_offer", "location_selector": "p.fs16.fc_base.mt5:not(.dFlex)", "label": "Minería"}),
+    ("Bumeran", "https://www.bumeran.com.ar/empleos-busqueda-mineria.html", {"mode": "jsonld", "label": "Minería"}),
 ]
 
 # Palabras clave del CV para marcar afinidad (no descarta nada, solo puntúa)
@@ -204,10 +215,12 @@ def scrape():
 
         browser.close()
 
-    # dedup por url
+    # dedup por url canónica (sin query/fragment de tracking) — el mismo
+    # aviso puede salir en más de una búsqueda guardada con distintos
+    # parámetros de tracking y hay que tratarlo como uno solo.
     seen = {}
     for r in results:
-        seen[r["url"]] = r
+        seen[canonical_url(r["url"])] = r
     deduped = sorted(seen.values(), key=lambda r: -r["score"])
 
     OUT_PATH.write_text(json.dumps(deduped, ensure_ascii=False, indent=2), encoding="utf-8")
